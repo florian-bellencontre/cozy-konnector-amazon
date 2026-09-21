@@ -13426,7 +13426,7 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     if (!FORCE_FETCH_ALL) {
       // Base the period selection on the newest bill actually saved rather
       // than on the trigger's last_execution : a run that "succeeds" without
-      // saving anything (e.g. the fetchOrdersCount guard kicking in)
+      // saving anything (e.g. the fetchPagesCount guard kicking in)
       // must not shrink the next run's window.
       const distanceInDays = newestBillDate
         ? getDateDistanceInDays(newestBillDate)
@@ -13519,18 +13519,17 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
 
   // P
   async fetchPeriodWithIframes(period, { knownOrderIds, knownSkipMaxDate }) {
-    const ordersCount = await this.runInWorker('fetchOrdersCount', period)
-    this.log('info', `Found ${ordersCount} orders for period ${period}`)
+    const pagesCount = await this.runInWorker('fetchPagesCount', period)
+    this.log('info', `Found ${pagesCount} pages for period ${period}`)
     // runInWorker resolves to false when the worker webview reloads mid-call
     // (flagship behaviour) : treat this as a failure so the caller falls back
     // to fetchPeriodWithNavigation instead of silently saving nothing.
-    if (typeof ordersCount !== 'number') {
-      throw new Error(`fetchOrdersCount returned ${ordersCount}`)
+    if (typeof pagesCount !== 'number') {
+      throw new Error(`fetchPagesCount returned ${pagesCount}`)
     }
-    if (ordersCount === 0) {
+    if (pagesCount === 0) {
       return []
     }
-    const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
     const rawBills = await this.runInWorker('extractPeriodBills', {
       period,
       pagesCount,
@@ -13547,12 +13546,11 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   async fetchPeriodWithNavigation(period, context) {
     this.log('info', `📍️ fetchPeriodWithNavigation starts for ${period}`)
     await this.navigateToOrdersPage(period, 0)
-    const ordersCount = await this.runInWorker('getOrdersCount')
-    this.log('info', `Found ${ordersCount} orders for period ${period}`)
-    if (ordersCount === 0) {
+    const pagesCount = await this.runInWorker('getPagesCount')
+    this.log('info', `Found ${pagesCount} pages for period ${period}`)
+    if (pagesCount === 0) {
       return
     }
-    const pagesCount = Math.ceil(ordersCount / ORDERS_PER_PAGE)
     // The launcher rebuilds its whole existing files index on every
     // saveBills call : save every few pages instead of every page to limit
     // those rebuilds while keeping regular checkpoints.
@@ -13614,13 +13612,13 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     )
     // The year dropdown is a native select now : navigating with the
     // timeFilter url parameter is more reliable than emulating the dropdown.
-    // Remove the current counter element first so we cannot match the previous
+    // Remove the current orders container first so we cannot match the previous
     // page's DOM while the new one is loading.
-    await this.runInWorker('deleteElement', '.num-orders')
+    await this.runInWorker('deleteElement', '.js-yo-container')
     await this.goto(
       `${orderHistoryUrl}?timeFilter=${period}&startIndex=${startIndex}`
     )
-    await this.waitForElementInWorker('.num-orders')
+    await this.waitForElementInWorker('.js-yo-container')
   }
 
   async handleContextInfos(context) {
@@ -13682,8 +13680,8 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   // W
-  async fetchOrdersCount(period) {
-    this.log('info', '📍️ fetchOrdersCount starts')
+  async fetchPagesCount(period) {
+    this.log('info', '📍️ fetchPagesCount starts')
     const response = await window.fetch(
       `${orderHistoryUrl}?timeFilter=${period}&startIndex=0`,
       { credentials: 'include' }
@@ -13695,12 +13693,13 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
       await response.text(),
       'text/html'
     )
-    const element = doc.querySelector('.num-orders')
-    if (!element) {
-      throw new Error('num-orders not found in fetched orders page')
+    const pagesCount = getPagesCountFromDocument(doc)
+    if (pagesCount === null) {
+      throw new Error(
+        'Unable to determine pages count from fetched orders page'
+      )
     }
-    const count = parseInt(element.textContent.trim(), 10)
-    return isNaN(count) ? 0 : count
+    return pagesCount
   }
 
   // W
@@ -13876,27 +13875,24 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   // W
-  async getOrdersCount() {
-    this.log('info', '📍️ getOrdersCount starts')
-    let ordersCount
+  async getPagesCount() {
+    this.log('info', '📍️ getPagesCount starts')
+    // The container appears before its content (counter label, cards,
+    // pagination) is rendered : recompute on every tick instead of resolving
+    // as soon as the container exists, and wait until the helper can
+    // actually determine a pages count.
+    let pagesCount = null
     await (0,p_wait_for__WEBPACK_IMPORTED_MODULE_2__["default"])(
       () => {
-        const element = document.querySelector('.num-orders')
-        if (element && element.textContent.includes('commande')) {
-          ordersCount = parseInt(element.textContent.trim(), 10)
-          if (isNaN(ordersCount)) {
-            ordersCount = 0
-          }
-          return true
-        }
-        return false
+        pagesCount = getPagesCountFromDocument(document)
+        return pagesCount !== null
       },
       {
         interval: 1000,
         timeout: 30 * 1000
       }
     )
-    return ordersCount
+    return pagesCount
   }
 
   // W
@@ -14249,8 +14245,8 @@ connector
       'setListenerPassword',
       'dismissCookieBanner',
       'clickSignInLink',
-      'getOrdersCount',
-      'fetchOrdersCount',
+      'getPagesCount',
+      'fetchPagesCount',
       'deleteElement',
       'extractPageBills',
       'extractPeriodBills',
@@ -14261,6 +14257,42 @@ connector
   .catch(err => {
     log.warn(err)
   })
+
+// Returns the pages count for the orders page currently in doc, or null when
+// it cannot be determined. Three signals are tried in order :
+// - the orders counter label (either the old `.num-orders` markup or the
+//   `form.js-time-filter-form label.time-filter__label b` fallback also used
+//   by the amazon-orders library) : this is the only signal available on the
+//   pages served to fetch(), which are empty shells with no cards and no
+//   pagination (see the comment near orderHistoryUrl above).
+// - the pagination widget's highest page number, on the live DOM.
+// - the mere presence of order cards, on the live DOM, when pagination has a
+//   single page and therefore no page numbers.
+function getPagesCountFromDocument(doc) {
+  const counterElement = doc.querySelector(
+    '.num-orders, form.js-time-filter-form label.time-filter__label b'
+  )
+  if (counterElement) {
+    const ordersCount = parseInt(counterElement.textContent.trim(), 10)
+    if (!isNaN(ordersCount)) {
+      return Math.ceil(ordersCount / ORDERS_PER_PAGE)
+    }
+  }
+  let maxPage = 0
+  for (const li of doc.querySelectorAll('.a-pagination li')) {
+    const page = parseInt(li.textContent.trim(), 10)
+    if (!isNaN(page) && page > maxPage) {
+      maxPage = page
+    }
+  }
+  if (maxPage > 0) {
+    return maxPage
+  }
+  if (doc.querySelectorAll(orderCardSelector).length > 0) {
+    return 1
+  }
+  return null
+}
 
 function getDateDistanceInDays(dateString) {
   const distanceMs = Date.now() - new Date(dateString).getTime()
