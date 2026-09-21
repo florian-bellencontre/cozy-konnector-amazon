@@ -13409,7 +13409,7 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   // P
   async fetch(context) {
     this.log('info', '📍️ Starting fetch')
-    const distanceInDays = await this.handleContextInfos(context)
+    await this.handleContextInfos(context)
     if (this.store?.email && this.store?.password) {
       this.log('info', 'Saving credentials...')
       const userCredentials = {
@@ -13421,25 +13421,36 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
     await this.goto(orderHistoryUrl)
     await this.waitForElementInWorker('#time-filter')
     let periods = await this.runInWorker('getYears', '#time-filter')
+    const { orderIds: knownOrderIds, newestBillDate } =
+      await this.getKnownBillsInfo()
     if (!FORCE_FETCH_ALL) {
-      // If false, we just need the last period depending on the distanceInDays value
-      if (distanceInDays <= 30) {
+      // Base the period selection on the newest bill actually saved rather
+      // than on the trigger's last_execution : a run that "succeeds" without
+      // saving anything (e.g. the fetchOrdersCount guard kicking in)
+      // must not shrink the next run's window.
+      const distanceInDays = newestBillDate
+        ? getDateDistanceInDays(newestBillDate)
+        : null
+      if (distanceInDays === null || distanceInDays >= 90) {
         this.log(
           'info',
-          'lastExecution under or equals 30 days, fetching the last 30 days period'
+          'No recent saved bill (missing or older than 90 days), fetching all periods'
+        )
+      } else if (distanceInDays <= 30) {
+        this.log(
+          'info',
+          'Newest saved bill under or equals 30 days old, fetching the last 30 days period'
         )
         periods = ['last30']
-      }
-      if (distanceInDays > 30 && distanceInDays < 90) {
+      } else {
         this.log(
           'info',
-          'lastExecution between 30 and 90 days, fetching the last 3 months period'
+          'Newest saved bill between 30 and 90 days old, fetching the last 3 months period'
         )
         periods = ['months-3']
       }
     }
     this.log('debug', 'Periods : ' + periods)
-    const knownOrderIds = await this.getKnownOrderIds()
     const knownSkipMaxDate = (0,date_fns__WEBPACK_IMPORTED_MODULE_3__["default"])(
       new Date(Date.now() - KNOWN_ORDERS_RECHECK_DAYS * 24 * 60 * 60 * 1000),
       'yyyy-MM-dd'
@@ -13472,7 +13483,7 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   }
 
   // P
-  async getKnownOrderIds() {
+  async getKnownBillsInfo() {
     // Orders whose bill is already saved can be skipped entirely : no invoice
     // popover fetch and above all no saveBills call, which spares the launcher
     // its costly existing files index rebuilds
@@ -13481,17 +13492,28 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
         toDefinition: () => ({ doctype: 'io.cozy.bills' })
       })
       const orderIds = new Set()
+      let newestBillDate = null
       for (const bill of bills || []) {
         const billVendor = String(bill.vendor || '').toLowerCase()
-        if (billVendor.startsWith('amazon') && bill.vendorRef) {
+        if (!billVendor.startsWith('amazon')) {
+          continue
+        }
+        if (bill.vendorRef) {
           orderIds.add(String(bill.vendorRef).split('_')[0])
+        }
+        const billDate = new Date(bill.date)
+        if (
+          !isNaN(billDate.getTime()) &&
+          (!newestBillDate || billDate > newestBillDate)
+        ) {
+          newestBillDate = billDate
         }
       }
       this.log('info', `Found ${orderIds.size} orders already saved`)
-      return Array.from(orderIds)
+      return { orderIds: Array.from(orderIds), newestBillDate }
     } catch (err) {
       this.log('warn', `Could not list already saved bills: ${err.message}`)
-      return []
+      return { orderIds: [], newestBillDate: null }
     }
   }
 
@@ -13499,6 +13521,12 @@ class AmazonContentScript extends cozy_clisk_dist_contentscript__WEBPACK_IMPORTE
   async fetchPeriodWithIframes(period, { knownOrderIds, knownSkipMaxDate }) {
     const ordersCount = await this.runInWorker('fetchOrdersCount', period)
     this.log('info', `Found ${ordersCount} orders for period ${period}`)
+    // runInWorker resolves to false when the worker webview reloads mid-call
+    // (flagship behaviour) : treat this as a failure so the caller falls back
+    // to fetchPeriodWithNavigation instead of silently saving nothing.
+    if (typeof ordersCount !== 'number') {
+      throw new Error(`fetchOrdersCount returned ${ordersCount}`)
+    }
     if (ordersCount === 0) {
       return []
     }
